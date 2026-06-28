@@ -31,6 +31,7 @@ pub fn key_binds() -> HashMap<KeyBind, Action> {
     bind!([], Key::Character(".".into()), NextFrame);
     bind!([], Key::Character(",".into()), PreviousFrame);
     bind!([], Key::Character("a".into()), AbRepeat);
+    bind!([], Key::Named(Named::F3), SearchFocus);
 
     key_binds
 }

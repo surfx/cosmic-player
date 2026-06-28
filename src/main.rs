@@ -190,6 +190,7 @@ pub enum Action {
     PreviousFrame,
     AbRepeat,
     PlaylistShuffle,
+    SearchFocus,
     WindowClose,
 }
 
@@ -216,6 +217,7 @@ impl MenuAction for Action {
             Self::PreviousFrame => Message::PreviousFrame,
             Self::AbRepeat => Message::AbRepeat,
             Self::PlaylistShuffle => Message::PlaylistShuffle,
+            Self::SearchFocus => Message::SearchFocus,
             Self::WindowClose => Message::WindowClose,
         }
     }
@@ -326,6 +328,11 @@ pub enum Message {
     ShowControls,
     RestoreActivate(segmented_button::Entity),
     ScrollToActive(f32),
+    SearchChanged(String),
+    SearchFocus,
+    NavUp,
+    NavDown,
+    NavEnter,
     SystemThemeModeChange(cosmic_theme::ThemeMode),
     WindowClose,
 }
@@ -357,6 +364,8 @@ pub struct App {
     ab_repeat: Option<(Option<f64>, Option<f64>)>,
     playback_speed: f64,
     restore_position: Option<f64>,
+    search: String,
+    full_items: Vec<(ProjectNode, u16)>,
     #[cfg(feature = "xdg-portal")]
     inhibit: tokio::sync::watch::Sender<bool>,
 }
@@ -383,10 +392,8 @@ impl App {
         self.current_audio = -1;
         self.text_codes.clear();
         self.current_text = None;
-        eprintln!("[CLOSE] was_open={}, calling update_nav_bar_active", was_open);
         self.update_mpris_meta();
         self.update_nav_bar_active();
-        eprintln!("[CLOSE] after update_nav_bar_active, active={:?}", self.nav_model.active());
         self.allow_idle();
         was_open
     }
@@ -640,7 +647,7 @@ impl App {
         self.save_player_state();
     }
 
-    fn save_player_state(&mut self) {
+    fn capture_nav_items(&self) -> Vec<(ProjectNode, u16)> {
         let mut items = Vec::new();
         for id in self.nav_model.iter() {
             if let Some(node) = self.nav_model.data::<ProjectNode>(id) {
@@ -648,18 +655,21 @@ impl App {
                 items.push((node.clone(), indent));
             }
         }
+        items
+    }
+
+    fn save_player_state(&mut self) {
+        let items = if self.search.is_empty() {
+            self.capture_nav_items()
+        } else {
+            self.full_items.clone()
+        };
         self.flags.config_state.player_state.items = items;
-        self.flags.config_state.player_state.active_path = self
-            .nav_model
-            .data::<ProjectNode>(self.nav_model.active())
-            .and_then(|node| match node {
-                ProjectNode::File { path, .. } => Some(path.clone()),
-                _ => None,
-            });
+        self.flags.config_state.player_state.active_path = match &self.flags.url_opt {
+            Some(url) => url.to_file_path().ok(),
+            None => None,
+        };
         self.flags.config_state.player_state.playback_position = Some((self.position * 1000.0) as u64);
-        eprintln!("[SAVE] active nav entity: {:?}, active_path: {:?}",
-            self.nav_model.active(),
-            self.flags.config_state.player_state.active_path);
         self.flags.config_state.player_state.projects = self
             .projects
             .iter()
@@ -694,10 +704,8 @@ impl App {
 
         // Restore saved items, tracking the active file entity
         let mut active_entity = segmented_button::Entity::default();
-        let mut matched = false;
 
-        eprintln!("[RESTORE] saved.active_path: {:?}", saved.active_path);
-        for (idx, (node, indent)) in saved.items.iter().enumerate() {
+        for (node, indent) in saved.items.iter() {
             let mut entity = self
                 .nav_model
                 .insert()
@@ -710,14 +718,11 @@ impl App {
 
             if let ProjectNode::File { path, .. } = node {
                 let is_match = Some(path) == saved.active_path.as_ref();
-                eprintln!("[RESTORE] item[{}] File path={:?} == active_path? {}", idx, path, is_match);
                 if is_match {
                     active_entity = entity_id;
-                    matched = true;
                 }
             }
         }
-        eprintln!("[RESTORE] matched={}, active_entity: {:?}", matched, active_entity);
 
         // Restore projects list from saved paths
         self.projects = saved
@@ -737,6 +742,8 @@ impl App {
         if !saved.projects.is_empty() || saved.active_path.is_some() {
             self.core.nav_bar_set_toggled(true);
         }
+
+        self.full_items = self.capture_nav_items();
 
         // Set url_opt so init() -> load() starts playback
         if let Some(active_path) = &saved.active_path {
@@ -945,7 +952,6 @@ impl App {
         let mut active_id = segmented_button::Entity::default();
 
         if let Some(tab_path) = tab_path_opt {
-            eprintln!("[UPDATE_NAV] tab_path: {:?}", tab_path);
             // Automatically expand tree to find and select active file
             loop {
                 let mut expand_opt = None;
@@ -961,7 +967,6 @@ impl App {
                             }
                             ProjectNode::File { path, .. } => {
                                 let matches = path == &tab_path;
-                                eprintln!("[UPDATE_NAV] File path={:?} matches={}", path, matches);
                                 if matches {
                                     active_id = id;
                                     break;
@@ -983,6 +988,51 @@ impl App {
             }
         }
         self.nav_model.activate(active_id);
+    }
+
+    fn refresh_nav_bar(&mut self) {
+        if self.search.is_empty() && self.full_items.is_empty() {
+            return;
+        }
+
+        let items = if self.search.is_empty() {
+            self.full_items.clone()
+        } else {
+            let search_lower = self.search.to_lowercase();
+            self.full_items.iter()
+                .filter(|(node, _)| node.name().to_lowercase().contains(&search_lower))
+                .cloned()
+                .collect()
+        };
+
+        // Rebuild nav_model
+        self.nav_model = nav_bar::Model::builder().build();
+
+        // Insert the "Open Folder" button
+        self.nav_model
+            .insert()
+            .icon(widget::icon::from_name("folder-open-symbolic").size(16))
+            .text(fl!("open-folder"));
+
+        for (node, indent) in items {
+            let mut entity = self.nav_model.insert().text(node.name().to_string());
+            if let Some(icon) = node.icon(16) {
+                entity = entity.icon(icon);
+            }
+            entity = entity.indent(indent);
+            let id = entity.id();
+            self.nav_model.data_set(id, node);
+        }
+
+        // Reliably restore the active item based on the playing song
+        self.update_nav_bar_active();
+    }
+
+    fn clear_search_if_active(&mut self) {
+        if !self.search.is_empty() {
+            self.search.clear();
+            self.refresh_nav_bar();
+        }
     }
 
     fn scroll_to_active(&self) -> Task<Message> {
@@ -1095,6 +1145,8 @@ impl Application for App {
             ab_repeat: None,
             playback_speed: 1.0,
             restore_position: None,
+            search: String::new(),
+            full_items: Vec::new(),
             #[cfg(feature = "xdg-portal")]
             inhibit,
         };
@@ -1137,6 +1189,47 @@ impl Application for App {
         Some(&self.nav_model)
     }
 
+    fn nav_bar(&self) -> Option<Element<'_, cosmic::Action<Self::Message>>> {
+        if !self.core().nav_bar_active() {
+            return None;
+        }
+
+        let nav_model = self.nav_model()?;
+
+        let mut nav = cosmic::widget::nav_bar(nav_model, |id| {
+            cosmic::Action::Cosmic(cosmic::app::Action::NavBar(id))
+        })
+        .into_container()
+        .width(Length::Shrink)
+        .height(Length::Fill);
+
+        let mut children = Vec::new();
+
+        if !self.core().is_condensed() {
+            nav = nav.max_width(280);
+
+            let search_input = widget::text_input("Filter...", &self.search)
+                .id(cosmic::widget::Id::new("search_input"))
+                .on_input(|s| cosmic::Action::App(Message::SearchChanged(s)))
+                .on_submit(|_| cosmic::Action::App(Message::NavEnter))
+                .width(Length::Fill);
+
+            let search_container = widget::container(search_input)
+                .padding([8, 8, 8, 8]) // 8px all around (gives ~5pt spacing below)
+                .width(Length::Fixed(280.0)); // Concrete width prevents collapsing
+
+            children.push(search_container.into());
+        }
+
+        children.push(nav.into());
+
+        let column = widget::column::with_children(children)
+            .width(Length::Shrink)
+            .height(Length::Fill);
+
+        Some(Element::from(column))
+    }
+
     fn on_escape(&mut self) -> Task<Self::Message> {
         if self.fullscreen {
             self.update(Message::Fullscreen)
@@ -1144,8 +1237,9 @@ impl Application for App {
             Task::none()
         }
     }
-
     fn on_nav_select(&mut self, id: nav_bar::Id) -> Task<Message> {
+        let was_searching = !self.search.is_empty();
+
         // Toggle open state and get clone of node data
         let node_opt = match self.nav_model.data_mut::<ProjectNode>(id) {
             Some(node) => {
@@ -1154,6 +1248,16 @@ impl Application for App {
             }
             None => None,
         };
+
+        if was_searching {
+            if let Some(ProjectNode::File { .. }) = &node_opt {
+                // Let the file load proceed, preserving the active search filter
+            } else {
+                // For folders, clear search immediately and abort click since positions change
+                self.clear_search_if_active();
+                return Task::none();
+            }
+        }
 
         match node_opt {
             Some(node) => {
@@ -1667,6 +1771,7 @@ impl Application for App {
                 }
             }
             Message::PlaylistShuffle => {
+                self.clear_search_if_active();
                 use rand::seq::SliceRandom;
                 let mut rng = rand::rng();
 
@@ -1782,7 +1887,6 @@ impl Application for App {
                         self.nav_model.data_set(id, node);
                     }
                     if is_active {
-                        eprintln!("[SHUFFLE] activating entity: {:?}", id);
                         self.nav_model.activate(id);
                     }
                 }
@@ -1817,11 +1921,7 @@ impl Application for App {
                 self.update_controls(true);
             }
             Message::RestoreActivate(entity) => {
-                eprintln!("[RESTORE_ACTIVATE] entity={:?}, nav_model.active() before={:?}",
-                    entity, self.nav_model.active());
                 self.nav_model.activate(entity);
-                eprintln!("[RESTORE_ACTIVATE] nav_model.active() after={:?}",
-                    self.nav_model.active());
                 return self.scroll_to_active();
             }
             Message::ScrollToActive(y) => {
@@ -1829,6 +1929,49 @@ impl Application for App {
                     cosmic::widget::Id::new("cosmic-nav-bar-scrollable"),
                     cosmic::iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(y) },
                 );
+            }
+            Message::SearchChanged(search) => {
+                if self.search == search {
+                    return Task::none();
+                }
+                // Only capture the current list if we are starting a new search
+                if self.search.is_empty() && !search.is_empty() {
+                    let items = self.capture_nav_items();
+                    // Safety check to prevent overwriting with an empty list
+                    if !items.is_empty() {
+                        self.full_items = items;
+                    }
+                }
+                self.search = search;
+                self.refresh_nav_bar();
+                return self.scroll_to_active();
+            }
+            Message::SearchFocus => {
+                return cosmic::widget::text_input::focus(cosmic::widget::Id::new("search_input"));
+            }
+            Message::NavUp => {
+                let curr_id = self.nav_model.active();
+                let curr_pos = self.nav_model.position(curr_id).unwrap_or(0);
+                if curr_pos > 0 {
+                    if let Some(prev_id) = self.nav_model.entity_at(curr_pos - 1) {
+                        self.nav_model.activate(prev_id);
+                        return self.scroll_to_active();
+                    }
+                }
+            }
+            Message::NavDown => {
+                let curr_id = self.nav_model.active();
+                let curr_pos = self.nav_model.position(curr_id).unwrap_or(0);
+                if let Some(next_id) = self.nav_model.entity_at(curr_pos + 1) {
+                    self.nav_model.activate(next_id);
+                    return self.scroll_to_active();
+                }
+            }
+            Message::NavEnter => {
+                let active_id = self.nav_model.active();
+                if active_id != segmented_button::Entity::default() {
+                    return self.on_nav_select(active_id);
+                }
             }
             Message::VideoAreaClick => {
                 if self.dropdown_opt.is_some() {
@@ -2477,13 +2620,20 @@ impl Application for App {
         struct ThemeSubscription;
 
         let mut subscriptions = vec![
-            event::listen_with(|event, _status, _window_id| match event {
+            event::listen_with(|event, status, _window_id| match event {
                 Event::Keyboard(KeyEvent::KeyPressed {
                     modifiers,
                     physical_key,
                     key,
                     ..
-                }) => Some(Message::Key(modifiers, physical_key, key)),
+                }) if status == event::Status::Ignored => {
+                    match key {
+                        Key::Named(cosmic::iced::keyboard::key::Named::ArrowUp) => Some(Message::NavUp),
+                        Key::Named(cosmic::iced::keyboard::key::Named::ArrowDown) => Some(Message::NavDown),
+                        Key::Named(cosmic::iced::keyboard::key::Named::Enter) => Some(Message::NavEnter),
+                        _ => Some(Message::Key(modifiers, physical_key, key)),
+                    }
+                }
                 Event::Mouse(MouseEvent::CursorMoved { .. }) => Some(Message::ShowControls),
                 Event::Mouse(MouseEvent::WheelScrolled { delta }) => Some(Message::Scrolled(delta)),
                 _ => None,

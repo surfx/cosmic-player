@@ -7,3 +7,7 @@
 /vendor/
 /vendor.tar
 .idea/
+scripts/backup_stage/
+scripts/logs/
+scripts/ia/
+scripts/backup_stage.tar.gz.gpg

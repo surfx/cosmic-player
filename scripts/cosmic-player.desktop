@@ -1,0 +1,11 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Name=Cosmic Player (Dev)
+Comment=Media player COSMIC (Desenvolvimento)
+Exec=/mnt/disco_d/projetos/rust/cosmic-player/scripts/run.sh %U
+Icon=/mnt/disco_d/projetos/rust/cosmic-player/scripts/com.system76.CosmicPlayer.svg
+Terminal=false
+Type=Application
+Categories=COSMIC;AudioVideo;Player;Video;
+
+# cp /mnt/disco_d/projetos/rust/cosmic-player/scripts/cosmic-player.desktop ~/.local/share/applications/com.system76.CosmicPlayer.desktop

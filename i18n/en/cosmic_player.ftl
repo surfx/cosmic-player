@@ -37,6 +37,7 @@ quit = Quit
 
 repeat-disabled = Repeat disabled
 repeat-track = Repeat track
+shuffle-playlist = Shuffle playlist
 
 playback = Playback
 next-frame = Next Frame

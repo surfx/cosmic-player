@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use cosmic::widget;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProjectNode {
     Folder {
         name: String,
@@ -42,6 +43,16 @@ impl ProjectNode {
                 root: false,
             }
         } else {
+            // Filter supported media files
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_lowercase();
+            let supported = [
+                "mp4", "mkv", "avi", "mov", "wmv", "flv", "webm", "m4v", "mpg", "mpeg", "3gp", "3g2",
+                "mp3", "flac", "wav", "ogg", "m4a", "aac", "wma", "opus", "m4b", "aif", "aiff", "ape",
+                "wv", "dff", "dsf", "m4p", "mp2", "ts", "mts", "m2ts", "vob", "ogv", "m2v", "asf", "divx"
+            ];
+            if !supported.contains(&ext.as_str()) {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Unsupported file type"));
+            }
             Self::File { path, name }
         })
     }

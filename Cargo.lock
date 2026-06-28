@@ -1133,6 +1133,7 @@ dependencies = [
  "libcosmic",
  "log",
  "mpris-server",
+ "rand 0.9.4",
  "rust-embed",
  "serde",
  "tempfile",

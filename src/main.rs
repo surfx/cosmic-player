@@ -22,7 +22,7 @@ use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::{fs, process, thread};
+use std::{fs, io, process, thread};
 use tokio::sync::mpsc;
 
 use crate::config::{CONFIG_VERSION, Config, ConfigState, RepeatState};
@@ -107,12 +107,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     #[cfg(all(unix, not(target_os = "redox")))]
-    match fork::daemon(true, true) {
-        Ok(fork::Fork::Child) => (),
-        Ok(fork::Fork::Parent(_child_pid)) => process::exit(0),
-        Err(err) => {
-            eprintln!("failed to daemonize: {:?}", err);
-            process::exit(1);
+    if !args.foreground {
+        match fork::daemon(true, true) {
+            Ok(fork::Fork::Child) => (),
+            Ok(fork::Fork::Parent(_child_pid)) => process::exit(0),
+            Err(err) => {
+                eprintln!("failed to daemonize: {:?}", err);
+                process::exit(1);
+            }
         }
     }
 
@@ -187,6 +189,7 @@ pub enum Action {
     NextFrame,
     PreviousFrame,
     AbRepeat,
+    PlaylistShuffle,
     WindowClose,
 }
 
@@ -212,6 +215,7 @@ impl MenuAction for Action {
             Self::NextFrame => Message::NextFrame,
             Self::PreviousFrame => Message::PreviousFrame,
             Self::AbRepeat => Message::AbRepeat,
+            Self::PlaylistShuffle => Message::PlaylistShuffle,
             Self::WindowClose => Message::WindowClose,
         }
     }
@@ -311,6 +315,7 @@ pub enum Message {
     NextFrame,
     PreviousFrame,
     EndOfStream,
+    PlaylistShuffle,
     MissingPlugin(gst::Message),
     MprisChannel(MprisMeta, MprisState, mpsc::UnboundedSender<MprisEvent>),
     NewFrame,
@@ -319,6 +324,8 @@ pub enum Message {
     VideoAreaClick,
     PlaybackSpeed(f64),
     ShowControls,
+    RestoreActivate(segmented_button::Entity),
+    ScrollToActive(f32),
     SystemThemeModeChange(cosmic_theme::ThemeMode),
     WindowClose,
 }
@@ -349,6 +356,7 @@ pub struct App {
     current_text: Option<i32>,
     ab_repeat: Option<(Option<f64>, Option<f64>)>,
     playback_speed: f64,
+    restore_position: Option<f64>,
     #[cfg(feature = "xdg-portal")]
     inhibit: tokio::sync::watch::Sender<bool>,
 }
@@ -375,8 +383,10 @@ impl App {
         self.current_audio = -1;
         self.text_codes.clear();
         self.current_text = None;
+        eprintln!("[CLOSE] was_open={}, calling update_nav_bar_active", was_open);
         self.update_mpris_meta();
         self.update_nav_bar_active();
+        eprintln!("[CLOSE] after update_nav_bar_active, active={:?}", self.nav_model.active());
         self.allow_idle();
         was_open
     }
@@ -392,18 +402,26 @@ impl App {
             None => return Task::none(),
         };
 
+        self.update_nav_bar_active();
+
         log::info!("Loading {}", url);
 
         // Add to recent files, ensuring only one entry
         self.flags.config_state.recent_files.retain(|x| x != &url);
         self.flags.config_state.recent_files.push_front(url.clone());
         self.flags.config_state.recent_files.truncate(10);
-        self.save_config_state();
+        self.save_player_state();
 
-        let video = match video::new_video(&url, video::VideoSettings::default()) {
+        let mut video = match video::new_video(&url, video::VideoSettings::default()) {
             Ok(ok) => ok,
             Err(err) => return err,
         };
+
+        if let Some(pos) = self.restore_position.take() {
+            if let Err(err) = video.seek(Duration::from_secs_f64(pos), true) {
+                log::warn!("failed to restore position {}: {}", pos, err);
+            }
+        }
 
         self.duration = video.duration().as_secs_f64();
         let pipeline = video.pipeline();
@@ -468,7 +486,7 @@ impl App {
                 Self::apply_speed(video, self.playback_speed);
             }
         }
-        self.update_title()
+        self.update_title().chain(self.scroll_to_active())
     }
 
     fn open_folder<P: AsRef<Path>>(&mut self, path: P, mut position: u16, indent: u16) {
@@ -497,6 +515,7 @@ impl App {
             let entry_path = entry.path();
             let node = match ProjectNode::new(&entry_path) {
                 Ok(ok) => ok,
+                Err(err) if err.kind() == io::ErrorKind::InvalidData => continue,
                 Err(err) => {
                     log::error!(
                         "failed to open directory {:?} entry {:?}: {}",
@@ -591,6 +610,8 @@ impl App {
         let position = self.nav_model.position(id).unwrap_or(0);
 
         self.open_folder(path, position + 1, 1);
+
+        self.save_player_state();
     }
 
     fn add_file_to_project(&mut self, path: impl AsRef<Path>) {
@@ -615,6 +636,36 @@ impl App {
             entity = entity.icon(icon);
         }
         entity.data(node);
+
+        self.save_player_state();
+    }
+
+    fn save_player_state(&mut self) {
+        let mut items = Vec::new();
+        for id in self.nav_model.iter() {
+            if let Some(node) = self.nav_model.data::<ProjectNode>(id) {
+                let indent = self.nav_model.indent(id).unwrap_or(0);
+                items.push((node.clone(), indent));
+            }
+        }
+        self.flags.config_state.player_state.items = items;
+        self.flags.config_state.player_state.active_path = self
+            .nav_model
+            .data::<ProjectNode>(self.nav_model.active())
+            .and_then(|node| match node {
+                ProjectNode::File { path, .. } => Some(path.clone()),
+                _ => None,
+            });
+        self.flags.config_state.player_state.playback_position = Some((self.position * 1000.0) as u64);
+        eprintln!("[SAVE] active nav entity: {:?}, active_path: {:?}",
+            self.nav_model.active(),
+            self.flags.config_state.player_state.active_path);
+        self.flags.config_state.player_state.projects = self
+            .projects
+            .iter()
+            .map(|(_, path)| path.clone())
+            .collect();
+        self.save_config_state();
     }
 
     fn save_config_state(&mut self) {
@@ -623,6 +674,81 @@ impl App {
         {
             log::error!("failed to save config_state: {}", err);
         }
+    }
+
+    fn restore_player_state(&mut self) -> Task<Message> {
+        let saved = &self.flags.config_state.player_state;
+
+        // Rebuild nav_model
+        self.nav_model = nav_bar::Model::builder().build();
+
+        // Insert the "Open Folder" button
+        self.nav_model
+            .insert()
+            .icon(widget::icon::from_name("folder-open-symbolic").size(16))
+            .text(fl!("open-folder"));
+
+        if saved.items.is_empty() {
+            return Task::none();
+        }
+
+        // Restore saved items, tracking the active file entity
+        let mut active_entity = segmented_button::Entity::default();
+        let mut matched = false;
+
+        eprintln!("[RESTORE] saved.active_path: {:?}", saved.active_path);
+        for (idx, (node, indent)) in saved.items.iter().enumerate() {
+            let mut entity = self
+                .nav_model
+                .insert()
+                .indent(*indent)
+                .text(node.name().to_string());
+            if let Some(icon) = node.icon(16) {
+                entity = entity.icon(icon);
+            }
+            let entity_id = entity.data(node.clone()).id();
+
+            if let ProjectNode::File { path, .. } = node {
+                let is_match = Some(path) == saved.active_path.as_ref();
+                eprintln!("[RESTORE] item[{}] File path={:?} == active_path? {}", idx, path, is_match);
+                if is_match {
+                    active_entity = entity_id;
+                    matched = true;
+                }
+            }
+        }
+        eprintln!("[RESTORE] matched={}, active_entity: {:?}", matched, active_entity);
+
+        // Restore projects list from saved paths
+        self.projects = saved
+            .projects
+            .iter()
+            .map(|path| {
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                (name, path.clone())
+            })
+            .collect();
+
+        // Open the nav bar if we have projects or files
+        if !saved.projects.is_empty() || saved.active_path.is_some() {
+            self.core.nav_bar_set_toggled(true);
+        }
+
+        // Set url_opt so init() -> load() starts playback
+        if let Some(active_path) = &saved.active_path {
+            self.flags.url_opt = url::Url::from_file_path(active_path).ok();
+            self.restore_position = saved.playback_position.map(|ms| ms as f64 / 1000.0);
+        } else {
+            return Task::none();
+        }
+
+        // Defer activation to the first update cycle (same timing as shuffle)
+        // This ensures the widget tree exists before activating
+        cosmic::task::message(cosmic::action::app(Message::RestoreActivate(active_entity)))
     }
 
     fn update_controls(&mut self, in_use: bool) {
@@ -759,6 +885,26 @@ impl App {
                 new.album_art_opt = url::Url::from_file_path(album_art.path()).ok();
             }
         }
+
+        // Fallback: parse filename if artist or title is missing
+        if (new.title.is_empty() || new.artists.is_empty())
+            && let Some(url) = &self.flags.url_opt
+            && let Ok(path) = url.to_file_path()
+        {
+            if let Some(file_stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if let Some((artist, title)) = file_stem.split_once(" - ") {
+                    if new.artists.is_empty() {
+                        new.artists = vec![artist.trim().to_string()];
+                    }
+                    if new.title.is_empty() {
+                        new.title = title.trim().to_string();
+                    }
+                } else if new.title.is_empty() {
+                    new.title = file_stem.to_string();
+                }
+            }
+        }
+
         if let Some((old, _, tx)) = &mut self.mpris_opt
             && new != *old
         {
@@ -799,6 +945,7 @@ impl App {
         let mut active_id = segmented_button::Entity::default();
 
         if let Some(tab_path) = tab_path_opt {
+            eprintln!("[UPDATE_NAV] tab_path: {:?}", tab_path);
             // Automatically expand tree to find and select active file
             loop {
                 let mut expand_opt = None;
@@ -806,13 +953,16 @@ impl App {
                     if let Some(node) = self.nav_model.data(id) {
                         match node {
                             ProjectNode::Folder { path, open, .. } => {
-                                if tab_path.starts_with(path) && !*open {
+                                let matches = tab_path.starts_with(path);
+                                if matches && !*open {
                                     expand_opt = Some(id);
                                     break;
                                 }
                             }
                             ProjectNode::File { path, .. } => {
-                                if path == &tab_path {
+                                let matches = path == &tab_path;
+                                eprintln!("[UPDATE_NAV] File path={:?} matches={}", path, matches);
+                                if matches {
                                     active_id = id;
                                     break;
                                 }
@@ -833,6 +983,24 @@ impl App {
             }
         }
         self.nav_model.activate(active_id);
+    }
+
+    fn scroll_to_active(&self) -> Task<Message> {
+        let active_id = self.nav_model.active();
+        let active_pos = self.nav_model.position(active_id).unwrap_or(0);
+        let container_padding = 8.0; // space_xxs
+        let button_height = 32.0;
+        let spacing = 8.0; // space_xxs
+        let scroll_y = (container_padding + active_pos as f32 * (button_height + spacing) - 160.0)
+            .max(0.0);
+        
+        // Defer scroll command to ensure the widget tree is fully updated
+        Task::perform(
+            async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            },
+            move |_| action::app(Message::ScrollToActive(scroll_y))
+        )
     }
 
     fn update_title(&mut self) -> Task<Message> {
@@ -926,27 +1094,32 @@ impl Application for App {
             current_text: None,
             ab_repeat: None,
             playback_speed: 1.0,
+            restore_position: None,
             #[cfg(feature = "xdg-portal")]
             inhibit,
         };
 
-        // Do not show nav bar by default. Will be opened by open_project if needed
-        app.core.nav_bar_set_toggled(false);
-        //TODO: handle command line arguments that are folders?
-
-        // Add button to open a project
-        //TODO: remove and show this based on open projects?
-        app.nav_model
-            .insert()
-            .icon(widget::icon::from_name("folder-open-symbolic").size(16))
-            .text(fl!("open-folder"));
-
-        // TODO: This is kind of ugly and may be handled better in Arguments
+        // Determine if command line arguments were provided
         let maybe_path = app
             .flags
             .url_opt
             .as_ref()
             .and_then(|url| url.to_file_path().ok());
+        let has_cli_args = app.flags.urls.is_some() || maybe_path.is_some();
+
+        let scroll_task = if has_cli_args {
+            // Command line args provided - setup normally
+            app.core.nav_bar_set_toggled(false);
+            app.nav_model
+                .insert()
+                .icon(widget::icon::from_name("folder-open-symbolic").size(16))
+                .text(fl!("open-folder"));
+            Task::none()
+        } else {
+            // No command line args - restore saved state
+            app.restore_player_state()
+        };
+
         let command = match (app.flags.urls.take(), maybe_path) {
             (Some(urls), _) => {
                 cosmic::task::message(cosmic::action::app(Message::MultipleLoad(urls)))
@@ -956,7 +1129,8 @@ impl Application for App {
             }
             _ => app.load(),
         };
-        (app, command)
+
+        (app, command.chain(scroll_task))
     }
 
     fn nav_model(&self) -> Option<&nav_bar::Model> {
@@ -1007,6 +1181,8 @@ impl Application for App {
                                 }
                             }
                         }
+
+                        self.save_player_state();
 
                         // Prevent nav bar from closing when selecting a
                         // folder in condensed mode.
@@ -1069,6 +1245,7 @@ impl Application for App {
             }
             Message::FileClose => {
                 self.close();
+                self.save_player_state();
             }
             Message::FileLoad(url) => {
                 self.flags.url_opt = Some(url);
@@ -1135,6 +1312,7 @@ impl Application for App {
                         }
                     }
                 }
+                self.save_player_state();
             }
             Message::FolderLoad(path) => {
                 self.open_project(path);
@@ -1197,6 +1375,7 @@ impl Application for App {
                     }
                 }
 
+                self.save_player_state();
                 self.core.nav_bar_set_toggled(true);
             }
             Message::Fullscreen => {
@@ -1374,7 +1553,6 @@ impl Application for App {
                     return Task::none();
                 }
 
-                //first we get info about current media id & position in nav_bar
                 let curr_id = self.nav_model.active();
                 let curr_position = match self.nav_model.position(curr_id) {
                     Some(pos) => pos,
@@ -1384,37 +1562,34 @@ impl Application for App {
                     }
                 };
 
+                // Seek to beginning if we're past 3 seconds
                 if let Some(video) = &mut self.video_opt {
                     self.position = video.position().as_secs_f64();
-
                     if self.position > 3.0 {
                         video.seek(0, false).expect("seek");
-                    } else {
-                        if self.nav_model.activate_position(curr_position - 1) {
-                            let curr_id = self.nav_model.active();
-                            match self.nav_model.data::<ProjectNode>(curr_id) {
-                                //The prev one is a media file, we play it.
-                                Some(ProjectNode::File { .. }) => {
-                                    return self.on_nav_select(curr_id);
-                                }
-
-                                //The prev one is a folder. We expand it and recall PlayPrev.
-                                Some(ProjectNode::Folder { .. }) => {
-                                    let _ = self.on_nav_select(curr_id);
-                                    return self.update(Message::PlayPrev);
-                                }
-
-                                //Unknown type. We do nothing.
-                                _ => log::warn!(
-                                    "unknown type: {:?}",
-                                    self.nav_model.data::<ProjectNode>(curr_id)
-                                ),
-                            }
-                        } else {
-                            // first file
-                            video.seek(0, false).expect("seek");
-                        }
+                        return Task::none();
                     }
+                }
+
+                // Navigate to previous track
+                if curr_position > 0 && self.nav_model.activate_position(curr_position - 1) {
+                    let curr_id = self.nav_model.active();
+                    match self.nav_model.data::<ProjectNode>(curr_id) {
+                        Some(ProjectNode::File { .. }) => {
+                            return self.on_nav_select(curr_id);
+                        }
+                        Some(ProjectNode::Folder { .. }) => {
+                            let _ = self.on_nav_select(curr_id);
+                            return self.update(Message::PlayPrev);
+                        }
+                        _ => log::warn!(
+                            "unknown type: {:?}",
+                            self.nav_model.data::<ProjectNode>(curr_id)
+                        ),
+                    }
+                } else if let Some(video) = &mut self.video_opt {
+                    // first file or same file - seek to beginning
+                    video.seek(0, false).expect("seek");
                 }
             }
 
@@ -1491,6 +1666,131 @@ impl Application for App {
                     self.update_controls(true);
                 }
             }
+            Message::PlaylistShuffle => {
+                use rand::seq::SliceRandom;
+                let mut rng = rand::rng();
+
+                let active_id = self.nav_model.active();
+                let mut target_indent = 0;
+                let mut start_pos = 0;
+                let mut end_pos = 0;
+                let mut range_found = false;
+
+                // 1. Identify the range of items to shuffle
+                if let Some(pos) = self.nav_model.position(active_id) {
+                    target_indent = self.nav_model.indent(active_id).unwrap_or(0);
+                    
+                    // Search upwards for the start of the list at this indent level
+                    let mut i = pos;
+                    while i > 0 {
+                        if let Some(id) = self.nav_model.entity_at(i - 1) {
+                            if self.nav_model.indent(id).unwrap_or(0) < target_indent {
+                                break;
+                            }
+                            i -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    start_pos = i;
+
+                    // Search downwards for the end of the list at this indent level
+                    let mut i = pos;
+                    loop {
+                        if let Some(id) = self.nav_model.entity_at(i + 1) {
+                            if self.nav_model.indent(id).unwrap_or(0) < target_indent {
+                                break;
+                            }
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    end_pos = i;
+                    range_found = true;
+                } else {
+                    // Nothing active, find the first list of files
+                    let mut first_file_pos = None;
+                    for id in self.nav_model.iter() {
+                        if let Some(node) = self.nav_model.data::<ProjectNode>(id) {
+                            if let ProjectNode::File { .. } = node {
+                                first_file_pos = self.nav_model.position(id);
+                                target_indent = self.nav_model.indent(id).unwrap_or(0);
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(pos) = first_file_pos {
+                        start_pos = pos;
+                        let mut i = pos;
+                        loop {
+                            if let Some(next_id) = self.nav_model.entity_at(i + 1) {
+                                if self.nav_model.indent(next_id).unwrap_or(0) < target_indent {
+                                    break;
+                                }
+                                i += 1;
+                            } else {
+                                break;
+                            }
+                        }
+                        end_pos = i;
+                        range_found = true;
+                    }
+                }
+
+                if !range_found { return Task::none(); }
+
+                // 2. Collect items in the range that are at the target indent level
+                let mut items = Vec::new();
+                for i in start_pos..=end_pos {
+                    if let Some(id) = self.nav_model.entity_at(i) {
+                        if self.nav_model.indent(id).unwrap_or(0) == target_indent {
+                            if let Some(node) = self.nav_model.data::<ProjectNode>(id) {
+                                if let ProjectNode::File { .. } = node {
+                                    items.push(id);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if items.len() <= 1 {
+                    return Task::none();
+                }
+
+                // 3. Extract data, shuffle, and re-insert
+                let mut data_list = Vec::new();
+                for &id in &items {
+                    let text = self.nav_model.text(id).unwrap_or_default().to_string();
+                    let icon = self.nav_model.icon(id).cloned();
+                    let node = self.nav_model.data::<ProjectNode>(id).cloned();
+                    data_list.push((text, icon, node, id == active_id));
+                }
+
+                data_list.shuffle(&mut rng);
+
+                for (idx, (text, icon, node, is_active)) in data_list.into_iter().enumerate() {
+                    let id = items[idx];
+                    self.nav_model.text_set(id, text);
+                    if let Some(icon) = icon {
+                        self.nav_model.icon_set(id, icon);
+                    } else {
+                        self.nav_model.icon_remove(id);
+                    }
+                    if let Some(node) = node {
+                        self.nav_model.data_set(id, node);
+                    }
+                    if is_active {
+                        eprintln!("[SHUFFLE] activating entity: {:?}", id);
+                        self.nav_model.activate(id);
+                    }
+                }
+
+                self.save_player_state();
+
+                return self.scroll_to_active();
+            }
             Message::PreviousFrame => {
                 if let Some(video) = &mut self.video_opt
                     && video.has_video()
@@ -1515,6 +1815,20 @@ impl Application for App {
                     Self::apply_speed(video, speed);
                 }
                 self.update_controls(true);
+            }
+            Message::RestoreActivate(entity) => {
+                eprintln!("[RESTORE_ACTIVATE] entity={:?}, nav_model.active() before={:?}",
+                    entity, self.nav_model.active());
+                self.nav_model.activate(entity);
+                eprintln!("[RESTORE_ACTIVATE] nav_model.active() after={:?}",
+                    self.nav_model.active());
+                return self.scroll_to_active();
+            }
+            Message::ScrollToActive(y) => {
+                return cosmic::iced::widget::scrollable::scroll_to(
+                    cosmic::widget::Id::new("cosmic-nav-bar-scrollable"),
+                    cosmic::iced::widget::scrollable::AbsoluteOffset { x: None, y: Some(y) },
+                );
             }
             Message::VideoAreaClick => {
                 if self.dropdown_opt.is_some() {
@@ -1649,6 +1963,7 @@ impl Application for App {
                 return self.update_config();
             }
             Message::WindowClose => {
+                self.save_player_state();
                 process::exit(0);
             }
         }
@@ -1685,9 +2000,16 @@ impl Application for App {
             format!("{:02}:{:02}:{:02}", hours, minutes, seconds)
         };
 
-        let Some(video) = &self.video_opt else {
+        let has_playable_files = self.nav_model.iter().any(|id| {
+            matches!(
+                self.nav_model.data::<ProjectNode>(id),
+                Some(ProjectNode::File { .. })
+            )
+        });
+
+        if self.video_opt.is_none() && !has_playable_files {
             //TODO: use space variables
-            let column = widget::column::with_capacity(4)
+            let column = widget::column::with_capacity(5)
                 .align_x(Alignment::Center)
                 .spacing(24)
                 .width(Length::Fill)
@@ -1701,6 +2023,7 @@ impl Application for App {
                         .push(widget::text::body(fl!("no-video-or-audio-file-open"))),
                 )
                 .push(widget::button::suggested(fl!("open-file")).on_press(Message::FileOpen))
+                .push(widget::button::standard(fl!("open-folder")).on_press(Message::FolderOpen))
                 .push(widget::space::vertical());
 
             return widget::container(column)
@@ -1708,80 +2031,103 @@ impl Application for App {
                 .height(Length::Fill)
                 .class(theme::Container::WindowBackground)
                 .into();
-        };
+        }
 
-        let muted = video.muted();
-        let volume = video.volume();
+        let (muted, volume, video_player, background_color, text_color_opt) = if let Some(video) = &self.video_opt {
+            let mut player: Element<_> = VideoPlayer::new(video)
+                .mouse_hidden(!self.controls)
+                .on_duration_changed(Message::DurationChanged)
+                .on_end_of_stream(Message::PlayNext)
+                .on_missing_plugin(Message::MissingPlugin)
+                .on_new_frame(Message::NewFrame)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .id(cosmic::widget::Id::new("video-player".to_string()))
+                .into();
 
-        let mut video_player: Element<_> = VideoPlayer::new(video)
-            .mouse_hidden(!self.controls)
-            .on_duration_changed(Message::DurationChanged)
-            .on_end_of_stream(Message::PlayNext)
-            .on_missing_plugin(Message::MissingPlugin)
-            .on_new_frame(Message::NewFrame)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .id(cosmic::widget::Id::new("video-player".to_string()))
-            .into();
+            let mut bg = Color::BLACK;
+            let mut tc = None;
 
-        let mut background_color = Color::BLACK;
-        let mut text_color_opt = None;
-        if !video.has_video() {
-            background_color = theme.cosmic().bg_component_color().into();
-            text_color_opt = Some(Color::from(theme.cosmic().on_bg_component_color()));
+            if !video.has_video() {
+                bg = theme.cosmic().bg_component_color().into();
+                tc = Some(Color::from(theme.cosmic().on_bg_component_color()));
 
-            let mut col = widget::column::with_capacity(10);
-            col = col.push(widget::space::vertical());
-            if let Some(album_art) = &self.album_art_opt {
-                col = col.push(
-                    widget::image(widget::image::Handle::from_path(album_art.path()))
-                        .content_fit(ContentFit::ScaleDown)
-                        .width(Length::Fill),
-                );
-            } else {
-                col = col.push(widget::icon::from_name("audio-x-generic-symbolic").size(256));
-            }
-            col = col.push(widget::space::vertical().height(space_s));
-            if self.mpris_meta.title.is_empty() {
-                col = col.push(widget::text::title4(fl!("untitled")));
-            } else {
-                col = col.push(widget::text::title4(&self.mpris_meta.title));
-            }
-            if self.mpris_meta.artists.is_empty() {
-                col = col.push(widget::text::body(fl!("unknown-author")));
-            } else {
-                for artist in self.mpris_meta.artists.iter() {
-                    col = col.push(widget::text::body(artist));
+                let mut col = widget::column::with_capacity(10);
+                col = col.push(widget::space::vertical());
+                if let Some(album_art) = &self.album_art_opt {
+                    col = col.push(
+                        widget::image(widget::image::Handle::from_path(album_art.path()))
+                            .content_fit(ContentFit::ScaleDown)
+                            .width(Length::Fill),
+                    );
+                } else {
+                    col = col.push(widget::icon::from_name("audio-x-generic-symbolic").size(256));
                 }
-            }
-            col = col.push(widget::space::vertical().height(space_s));
-            if !self.mpris_meta.album.is_empty() {
-                col = col.push(widget::text::body(fl!(
-                    "album",
-                    album = self.mpris_meta.album.as_str()
-                )));
-            }
-            if let Some(year) = &self.mpris_meta.album_year_opt {
-                col = col.push(widget::text::body(format!("{}", year)));
-            }
-            col = col.push(widget::space::vertical());
+                col = col.push(widget::space::vertical().height(space_s));
+                if self.mpris_meta.title.is_empty() {
+                    col = col.push(widget::text::title4(fl!("untitled")));
+                } else {
+                    col = col.push(widget::text::title4(&self.mpris_meta.title));
+                }
+                if self.mpris_meta.artists.is_empty() {
+                    col = col.push(widget::text::body(fl!("unknown-author")));
+                } else {
+                    for artist in self.mpris_meta.artists.iter() {
+                        col = col.push(widget::text::body(artist));
+                    }
+                }
+                col = col.push(widget::space::vertical().height(space_s));
+                if !self.mpris_meta.album.is_empty() {
+                    col = col.push(widget::text::body(fl!(
+                        "album",
+                        album = self.mpris_meta.album.as_str()
+                    )));
+                }
+                if let Some(year) = &self.mpris_meta.album_year_opt {
+                    col = col.push(widget::text::body(format!("{}", year)));
+                }
+                col = col.push(widget::space::vertical());
 
-            // Space to keep from going under control overlay
-            let mut control_height = space_xxs + 32 + space_xxs;
-            if self.core.is_condensed() {
-                control_height += space_xxs + 32;
-            }
+                // Space to keep from going under control overlay
+                let mut control_height = space_xxs + 32 + space_xxs;
+                if self.core.is_condensed() {
+                    control_height += space_xxs + 32;
+                }
 
-            // This is a hack to have the video player running but not visible (since the controls will cover it as an overlay)
-            video_player = widget::row::with_children(vec![
-                widget::space::horizontal().into(),
-                widget::container(col.push(widget::container(video_player).height(control_height)))
+                // This is a hack to have the video player running but not visible (since the controls will cover it as an overlay)
+                player = widget::row::with_children(vec![
+                    widget::space::horizontal().into(),
+                    widget::container(
+                        col.push(widget::container(player).height(control_height)),
+                    )
                     .width(320)
                     .into(),
-                widget::space::horizontal().into(),
-            ])
-            .into();
-        }
+                    widget::space::horizontal().into(),
+                ])
+                .into();
+            }
+            (video.muted(), video.volume(), player, bg, tc)
+        } else {
+            // No video but have files
+            let mut col = widget::column::with_capacity(10)
+                .align_x(Alignment::Center)
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+            col = col.push(widget::space::vertical());
+            col = col.push(widget::icon::from_name("audio-x-generic-symbolic").size(256));
+            col = col.push(widget::space::vertical().height(space_s));
+            col = col.push(widget::text::title4(fl!("untitled")));
+            col = col.push(widget::space::vertical());
+
+            (
+                false,
+                1.0,
+                col.into(),
+                theme.cosmic().bg_component_color().into(),
+                Some(Color::from(theme.cosmic().on_bg_component_color())),
+            )
+        };
 
         let mouse_area = widget::mouse_area(video_player)
             .on_press(Message::VideoAreaClick)
@@ -1949,7 +2295,7 @@ impl Application for App {
                     if self
                         .video_opt
                         .as_ref()
-                        .map_or(true, |video| video.has_video())
+                        .map_or(false, |video| video.has_video())
                     {
                         widget::button::icon(
                             widget::icon::from_svg_bytes(JUMP_BACKWARD_ICON).symbolic(true),
@@ -1977,7 +2323,7 @@ impl Application for App {
                 if self
                     .video_opt
                     .as_ref()
-                    .map_or(true, |video| video.has_video())
+                    .map_or(false, |video| video.has_video())
                 {
                     widget::button::icon(
                         widget::icon::from_svg_bytes(JUMP_FORWARD_ICON).symbolic(true),
@@ -1990,6 +2336,13 @@ impl Application for App {
                     .on_press(Message::PlayNext)
                 },
             );
+
+            row = row.push(widget::tooltip(
+                widget::button::icon(widget::icon::from_name("media-playlist-shuffle-symbolic").size(16))
+                    .on_press(Message::PlaylistShuffle),
+                widget::text(fl!("shuffle-playlist")),
+                widget::tooltip::Position::Top,
+            ));
 
             row = row.push(widget::tooltip(
                 widget::button::icon(

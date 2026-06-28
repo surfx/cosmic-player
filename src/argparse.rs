@@ -63,6 +63,7 @@ pub fn parse() -> Arguments {
                     }
                 }
                 Ok("version") => print_version(),
+                Ok("foreground") => arguments.foreground = true,
                 _ => warn!("unexpected flag: {}", arg.display()),
             }
         } else {
@@ -96,6 +97,8 @@ pub struct Arguments {
     pub url_opt: Option<Url>,
     pub thumbnail_opt: Option<PathBuf>,
     pub size_opt: Option<(u32, u32)>,
+    /// Skip daemonization
+    pub foreground: bool,
 }
 
 // #[derive(Debug)]
@@ -151,7 +154,8 @@ Options:
   -h, --help               Show this message
   -V, --version            Show the version of cosmic-player
   --thumbnail <output>     Generate thumbnail and save in output
-  --size <width>x<height>  Thumbnail size in pixels"#
+  --size <width>x<height>  Thumbnail size in pixels
+  --foreground             Run in foreground (do not daemonize)"#
     );
 
     std::process::exit(0);

@@ -38,6 +38,7 @@ quit = Sair
 off = Desligado
 clear-recent = Limpar lista de recentes
 repeat-track = Repetir faixa
+shuffle-playlist = Aleatorizar lista
 repeat-disabled = Repetição desabilitada
 next-frame = Próximo quadro
 previous-frame = Quadro anterior

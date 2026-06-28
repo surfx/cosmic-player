@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use crate::project::ProjectNode;
+
 pub const CONFIG_VERSION: u64 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -47,9 +49,14 @@ pub enum RepeatState {
     Track,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default)]
 pub struct PlayerState {
     pub repeat: RepeatState,
+    pub items: Vec<(ProjectNode, u16)>,
+    pub active_path: Option<PathBuf>,
+    pub projects: Vec<PathBuf>,
+    pub playback_position: Option<u64>,
 }
 
 #[derive(Clone, CosmicConfigEntry, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -64,9 +71,7 @@ impl Default for ConfigState {
         Self {
             recent_files: VecDeque::new(),
             recent_projects: VecDeque::new(),
-            player_state: PlayerState {
-                repeat: RepeatState::Disabled,
-            },
+            player_state: PlayerState::default(),
         }
     }
 }

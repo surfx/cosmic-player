@@ -19,6 +19,7 @@ ln -sf "$PROJECT_DIR/scripts/run.sh" "$LOCAL_BIN_DIR/cosmic-player"
 # 3. Substitui o atalho do sistema
 # Remove o atalho original se existir na pasta de usuário para evitar conflitos
 rm -f "$DESKTOP_DIR/com.system76.CosmicPlayer.desktop"
+rm -f "$DESKTOP_DIR/cosmic-player.desktop"
 
 # Copia o nosso atalho com o nome padrão do sistema para sobrepor o ícone do menu
 cp "$PROJECT_DIR/scripts/cosmic-player.desktop" "$DESKTOP_DIR/com.system76.CosmicPlayer.desktop"
